@@ -57,13 +57,16 @@ class ToolCallItem(BaseModel):
         "find_entity",
         "run_1c_report",
         "read_1c_file",
-        "create_object"
+        "create_object",
+        "open_form",
+        "get_system_info",
+        "run_1c_query"
     ]
     arguments: Dict[str, Any]
 
 
 class ClientAction(BaseModel):
-    action_type: Literal["fill_current_form", "open_created_object", "none"]
+    action_type: Literal["fill_current_form", "open_created_object", "open_form", "none"]
     payload: Dict[str, Any] = {}
 
 
@@ -95,7 +98,7 @@ class ToolResultRequest(BaseModel):
 
 class LLMDecision(BaseModel):
     decision: Literal["answer", "call_1c_tools", "fill_current_form"] = Field(
-        description="Выбери 'call_1c_tools', если нужно найти УИД в 1С, запустить отчет или создать объект. "
+        description="Выбери 'call_1c_tools', если нужно найти УИД в 1С, запустить отчет, получить системную информацию (get_system_info) или создать объект. "
                     "Выбери 'fill_current_form', если все УИД уже известны и нужно заполнить открытую форму. "
                     "Выбери 'answer', если достаточно текстового ответа или подсказки."
     )

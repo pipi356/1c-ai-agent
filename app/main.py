@@ -36,6 +36,9 @@ SYSTEM_PROMPT = """Ты — универсальный встроенный ИИ
 2. СОЗДАНИЕ ОБЪЕКТОВ ("create_object"):
    - Если пользователь просит создать объект любого типа, вызывай "create_object", передавая `metadata_type` (например, "Справочник.Склады" или "Документ.ЗаказКлиента") и собранные реквизиты в `attributes`.
 
+3. РАБОТА С ИНСТРУМЕНТОМ ("run_1c_query"):
+- Инструмент "run_1c_query": КРИТИЧЕСКИ ВАЖНО! Если пользователь в вопросе упоминает любой год (например, "за 2023 год", "в 2024"), ты ОБЯЗАН передать в аргумент `filters` точные границы периода: `{"startDate": "YYYY-01-01", "endDate": "YYYY-12-31"}`. Если год не указан, не передавай эти ключи. Никогда не подставляй цифры из прошлого ответа!
+
 ДОСТУПНЫЕ ИНСТРУМЕНТЫ 1С (tool_name):
   1) "find_entity": arguments = {"metadata_type": "Справочник.Контрагенты", "search_query": "строка"}
   2) "run_1c_report": arguments = {"report_name": "имя_отчета", "filters": {...}}
@@ -43,6 +46,7 @@ SYSTEM_PROMPT = """Ты — универсальный встроенный ИИ
   4) "create_object": arguments = {"metadata_type": "Справочник.Имя", "attributes": {...}}
   5) "get_system_info": arguments = {}
   6) "open_form": arguments = {"metadata_name": "Справочник.Имя"}
+  7) "run_1c_query": arguments = {"metadata_type": "Документ.Имя", "filters": {"Проведен": true}}
 """
 
 @app.on_event("startup")
@@ -132,58 +136,109 @@ async def chat_message(req: ChatRequest):
     decision = await call_ollama_structured(session["messages"])
     session["messages"].append({"role": "assistant", "content": decision.model_dump_json()})
 
+    print(f"\n[LLM DECISION] status: {decision.decision}")
+    if decision.tool_calls:
+        for tc in decision.tool_calls:
+            print(f"[LLM TOOL CALL] tool: {tc.tool_name}, args: {json.dumps(tc.arguments, ensure_ascii=False)}")
+
     return build_decision_response(req.session_id, decision, sources)
 
 
 @app.post("/api/v1/chat/tool-result", response_model=ChatResponse)
 async def tool_result(req: ToolResultRequest):
     session = SESSIONS.get(req.session_id)
+
+    print(f"\n[TOOL-RESULT FROM 1C] session: {req.session_id}")
+    for r in req.results:
+        print(f"  -> Tool: {r.tool_name}, Success: {r.success}")
+        print(f"     Data: {json.dumps(r.data, ensure_ascii=False) if r.data else 'None'}")
+        print(f"     Error: {r.error}")
+
     if not session:
         return ChatResponse(
             session_id=req.session_id,
             status="completed",
-            reply_text="Сессия не найдена. Повторите запрос."
+            reply_text="Сессия не найдена. Повторите запрос.",
+            sources=[]
         )
 
-    results_json = json.dumps([r.model_dump() for r in req.results], ensure_ascii=False, indent=2)
-    tool_feedback = (
-        f"[РЕЗУЛЬТАТ ВЫПОЛНЕНИЯ ИНСТРУМЕНТОВ НА СЕРВЕРЕ 1С]:\n{results_json}\n\n"
-        "Проанализируй полученные из 1С данные (включая найденные UID или данные отчета) и сформируй следующий шаг "
-        "(например, fill_current_form, create_object или финальный ответ answer)."
-    )
-    session["messages"].append({"role": "user", "content": tool_feedback})
-
-    decision = await call_ollama_structured(session["messages"])
-    session["messages"].append({"role": "assistant", "content": decision.model_dump_json()})
-
-    # Если был вызван create_object и 1С вернула созданный UID, открываем форму на клиенте
+    # 1. Сначала проверяем клиентские экшены (открытие форм и создание объектов)
     for r in req.results:
         if r.tool_name == "create_object" and r.success and isinstance(r.data, dict) and r.data.get("uid"):
             return ChatResponse(
                 session_id=req.session_id,
                 status="completed",
-                reply_text=decision.reply_text,
+                reply_text="Объект успешно создан.",
                 client_action=ClientAction(
                     action_type="open_created_object",
                     payload=r.data
                 ),
                 sources=session.get("sources", [])
             )
-        # Если был вызван open_form и 1С подтвердила успех, отдаем клиенту команду открыть форму
+        
         if r.tool_name == "open_form" and r.success:
             payload_data = r.data if isinstance(r.data, dict) else {"metadata_name": r.arguments.get("metadata_name")}
             return ChatResponse(
                 session_id=req.session_id,
                 status="completed",
-                reply_text=decision.reply_text,
+                reply_text="Справочник успешно открыт.",
                 client_action=ClientAction(
                     action_type="open_form",
                     payload=payload_data
                 ),
                 sources=session.get("sources", [])
             )
-    return build_decision_response(req.session_id, decision, session.get("sources", []))
 
+        if r.tool_name == "run_1c_query" and r.success:
+            results_json = json.dumps([r.model_dump() for r in req.results], ensure_ascii=False, indent=2)
+            tool_feedback = (
+                f"[РЕЗУЛЬТАТЫ ЗАПРОСА ИЗ БАЗЫ 1С]:\n{results_json}\n\n"
+                "На основе полученных данных сформируй вежливый и точный ответ на русском языке для пользователя. Не вызывай больше никаких инструментов."
+            )
+            session["messages"].append({"role": "user", "content": tool_feedback})
+            
+            decision = await call_ollama_structured(session["messages"])
+            session["messages"].append({"role": "assistant", "content": decision.model_dump_json()})
+            
+            return ChatResponse(
+                session_id=req.session_id,
+                status="completed",
+                reply_text=decision.reply_text or "Статистика по объекту успешно получена.",
+                sources=session.get("sources", [])
+            )
+
+    # 2. Для остальных инструментов (поиск, отчеты) прерываем цикл: 
+    # обрабатываем данные один раз и сразу отдаем текст пользователю, не давая модели уходить в рекурсию.
+    try:
+        results_json = json.dumps([r.model_dump() for r in req.results], ensure_ascii=False, indent=2)
+        tool_feedback = (
+            f"[РЕЗУЛЬТАТ ВЫПОЛНЕНИЯ ИНСТРУМЕНТОВ НА СЕРВЕРЕ 1С]:\n{results_json}\n\n"
+            "Сформируй окончательный и понятный ответ пользователю на основе этих данных. Не вызывай больше инструменты."
+        )
+        session["messages"].append({"role": "user", "content": tool_feedback})
+
+        # Временно принудительно меняем промпт или просто запрашиваем ответ без структуры tool_calls, 
+        # либо берем reply_text из решения модели
+        decision = await call_ollama_structured(session["messages"])
+        
+        # Защита от зацикливания: если модель опять просит tool_call, насильно превращаем в ответ
+        reply_content = decision.reply_text
+        if not reply_content or reply_content.strip() == "":
+            reply_content = "Данные по вашему запросу получены и обработаны."
+
+        return ChatResponse(
+            session_id=req.session_id,
+            status="completed",
+            reply_text=reply_content,
+            sources=session.get("sources", [])
+        )
+    except Exception as e:
+        return ChatResponse(
+            session_id=req.session_id,
+            status="completed",
+            reply_text=f"Результаты получены, но при формировании ответа произошла ошибка: {str(e)}",
+            sources=session.get("sources", [])
+        )
 
 @app.post("/api/v1/knowledge/upload")
 async def upload_knowledge_file(file: UploadFile = File(...)):
