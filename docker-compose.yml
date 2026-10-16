@@ -1,0 +1,18 @@
+services:
+  1c-ai-bridge:
+    build: .
+    container_name: 1c-ai-bridge
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    environment:
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - LLM_MODEL=qwen2.5:3b-instruct
+      - EMBED_MODEL=bge-m3:latest
+      - QDRANT_URL=http://host.docker.internal:6333
+      - QDRANT_COLLECTION=1c_knowledge_base
+    volumes:
+      - ./app:/app
+      - ./knowledge_inbox:/data/knowledge_inbox
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
